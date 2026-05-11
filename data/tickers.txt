@@ -1,0 +1,38 @@
+# One ticker per line. Lines starting with # are comments.
+# This is your master list — the script fetches data for every ticker here.
+#
+# Start small (50-200 tickers) so you can verify the workflow runs successfully,
+# then add more in batches.
+
+# Mega-cap tech
+AAPL
+MSFT
+NVDA
+GOOGL
+GOOG
+META
+AMZN
+TSLA
+AVGO
+ORCL
+
+# Major ETFs
+SPY
+QQQ
+DIA
+IWM
+VOO
+VTI
+
+# Sector ETFs (used by the macro tab)
+XLK
+XLF
+XLV
+XLE
+XLI
+XLP
+XLY
+XLU
+XLB
+XLRE
+XLC

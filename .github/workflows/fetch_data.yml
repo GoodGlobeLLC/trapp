@@ -1,0 +1,57 @@
+name: Fetch Stock Data
+
+# When this workflow runs:
+#   - Every weekday at 5pm Eastern Time (after market close, 22:00 UTC)
+#   - Every weekday at 11am Eastern Time (midday update, 16:00 UTC)
+#   - Manually via "Run workflow" button in the Actions tab
+#
+# Total API calls per run for 1000 tickers:
+#   - 10 batch quote calls + ~30 profile refreshes = 40 calls
+#   - 2 runs/day = 80 calls/day, well under FMP's 250/day free limit
+on:
+  schedule:
+    - cron: '0 16 * * 1-5'   # 11am ET weekdays
+    - cron: '0 22 * * 1-5'   # 5pm ET weekdays
+  workflow_dispatch:
+    inputs:
+      full_refresh:
+        description: 'Force full profile refresh for all tickers (uses more API quota)'
+        type: boolean
+        default: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # so we can commit the updated CSV back to the repo
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run fetcher
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: |
+          if [ "${{ inputs.full_refresh }}" = "true" ]; then
+            python fetch_data.py --full
+          else
+            python fetch_data.py
+          fi
+
+      - name: Commit and push updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/master.csv data/master.json
+          if git diff --staged --quiet; then
+            echo "No data changes to commit"
+          else
+            git commit -m "Update market data $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
