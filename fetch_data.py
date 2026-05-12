@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Valuatio bulk data fetcher.
+Valuatio bulk data fetcher — yfinance edition.
 
-Pulls all FMP profile + quote data for a list of tickers and writes a single CSV
-to data/master.csv. Designed to run nightly via GitHub Actions — completely free,
-unlimited fetches per day (GitHub gives 2000 free CI minutes/month).
+Pulls live + fundamental data from Yahoo Finance via the open-source `yfinance`
+library and writes everything to data/master.csv + data/master.json.
 
-Reads tickers from data/tickers.txt (one ticker per line).
-Reads FMP_API_KEY from environment variable (set in repo Settings → Secrets).
+Why yfinance:
+  - Free, unlimited, no API key
+  - Truly unrestricted free tier (unlike FMP which gated everything in Aug 2025)
+  - Industry standard for free stock data
+  - Drawback: scrapes Yahoo's web data — can break occasionally if Yahoo
+    changes their internal endpoints, but yfinance is actively maintained
+
+Designed for GitHub Actions. Reads tickers from data/tickers.txt.
+No API key required — just runs.
 """
 
 import csv
@@ -16,63 +22,36 @@ import os
 import sys
 import time
 from pathlib import Path
-from urllib import request, error
-from urllib.parse import quote
+from datetime import datetime, timezone
+
+try:
+    import yfinance as yf
+except ImportError:
+    print("ERROR: yfinance not installed. Run: pip install yfinance")
+    sys.exit(1)
 
 ROOT = Path(__file__).parent
 TICKERS_FILE = ROOT / "data" / "tickers.txt"
 OUTPUT_CSV = ROOT / "data" / "master.csv"
 OUTPUT_JSON = ROOT / "data" / "master.json"
 
-# FMP /quote endpoint accepts up to ~100 comma-separated symbols per call.
-# This is the secret to staying under 250/day even for thousands of tickers:
-# 1000 tickers = 10 calls instead of 1000.
-BATCH_SIZE = 100
-
-# Polite rate limit between batches (FMP free tier is 250/day total — these
-# batches help us stay well under)
-BATCH_DELAY_SEC = 1.0
-
-# Profile endpoint must be called one ticker at a time on free tier.
-# Don't refresh profile every run — it's stable data. Use --full to force.
-PROFILE_REFRESH_DAYS = 30
+# Yahoo can be aggressive about rate-limiting if you slam it. Be polite.
+BATCH_SIZE = 50              # tickers per yf.Tickers() call
+DELAY_BETWEEN_BATCHES = 1.5  # seconds
 
 
 def log(*args):
     print("[fetch_data]", *args, flush=True)
 
 
-def fetch_json(url, timeout=30):
-    """Fetch JSON from URL with proper error handling."""
-    req = request.Request(url, headers={"User-Agent": "Valuatio/1.0"})
-    try:
-        with request.urlopen(req, timeout=timeout) as resp:
-            if resp.status != 200:
-                log(f"  HTTP {resp.status} for {url[:80]}")
-                return None
-            return json.loads(resp.read())
-    except error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:200]
-        log(f"  HTTP {e.code}: {body}")
-        return None
-    except (error.URLError, json.JSONDecodeError, TimeoutError) as e:
-        log(f"  Fetch error: {e}")
-        return None
-
-
 def load_tickers():
     """Read tickers from data/tickers.txt, one per line."""
     if not TICKERS_FILE.exists():
         log(f"❌ {TICKERS_FILE} not found")
-        log("   Create it with one ticker per line:")
-        log("     AAPL")
-        log("     MSFT")
-        log("     NVDA")
         sys.exit(1)
     tickers = []
     for line in TICKERS_FILE.read_text().splitlines():
         t = line.strip().upper()
-        # Skip blanks and comments
         if not t or t.startswith("#"):
             continue
         tickers.append(t)
@@ -80,58 +59,21 @@ def load_tickers():
 
 
 def load_existing():
-    """Load existing CSV so we can preserve fields we don't refresh every run."""
+    """Preserve fields from prior run for tickers that fail this run."""
     if not OUTPUT_CSV.exists():
         return {}
-    existing = {}
+    out = {}
     with OUTPUT_CSV.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             tic = row.get("ticker", "").strip().upper()
             if tic:
-                existing[tic] = row
-    return existing
+                out[tic] = row
+    return out
 
 
-def fetch_batch_quotes(tickers, api_key):
-    """Fetch live quotes for a batch of tickers in ONE API call.
-    Returns dict: {ticker: quote_dict}
-    """
-    if not tickers:
-        return {}
-    symbols = ",".join(tickers)
-    url = f"https://financialmodelingprep.com/stable/batch-quote?symbols={quote(symbols)}&apikey={api_key}"
-    data = fetch_json(url)
-    if not isinstance(data, list):
-        return {}
-    return {item["symbol"]: item for item in data if "symbol" in item}
-
-
-def fetch_profile(ticker, api_key):
-    """Fetch full company profile (one ticker = one call). Used sparingly."""
-    url = f"https://financialmodelingprep.com/stable/profile?symbol={quote(ticker)}&apikey={api_key}"
-    data = fetch_json(url)
-    if isinstance(data, list) and data:
-        return data[0]
-    if isinstance(data, dict) and "symbol" in data:
-        return data
-    return None
-
-
-def should_refresh_profile(existing_row):
-    """True if the profile is stale or missing."""
-    if not existing_row:
-        return True
-    last = existing_row.get("profile_fetched_at", "")
-    if not last:
-        return True
-    try:
-        from datetime import datetime, timezone
-        last_dt = datetime.fromisoformat(last)
-        age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - last_dt).days
-        return age_days >= PROFILE_REFRESH_DAYS
-    except (ValueError, TypeError):
-        return True
+def now_iso():
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 # Columns matching the Valuatio app's expected schema
@@ -174,88 +116,141 @@ OUTPUT_COLUMNS = [
     "state",
     "phone",
     "address",
+    "dividend_yield",
     "fetched_at",
-    "profile_fetched_at",
 ]
 
 
-def build_row(ticker, quote_data, profile_data, existing_row):
-    """Merge quote + profile + existing into a single CSV row."""
-    from datetime import datetime, timezone
-    now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+def safe_get(d, *keys, default=""):
+    """Return first present non-None/non-empty value from a dict, trying keys in order."""
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, "", "N/A"):
+            return v
+    return default
 
-    # Start with whatever we had before so unchanged fields persist
+
+def extract_ceo(info):
+    """yfinance returns company officers as a list of dicts. Find the CEO."""
+    officers = info.get("companyOfficers") or []
+    for o in officers:
+        title = str(o.get("title", "")).lower()
+        if "ceo" in title or "chief executive" in title:
+            return o.get("name", "")
+    return ""
+
+
+def fmt_ipo_date(info):
+    """Some tickers have firstTradeDateEpochUtc. Convert to YYYY-MM-DD."""
+    ts = info.get("firstTradeDateEpochUtc")
+    if not ts:
+        return ""
+    try:
+        return datetime.utcfromtimestamp(int(ts)).date().isoformat()
+    except (TypeError, ValueError):
+        return ""
+
+
+def build_row(ticker, info, existing_row):
+    """Map yfinance Ticker.info dict → our CSV schema."""
     row = {col: (existing_row.get(col, "") if existing_row else "") for col in OUTPUT_COLUMNS}
     row["ticker"] = ticker
+    if not info:
+        return row
 
-    if quote_data:
-        # /stable/ endpoints use slightly different field names than /api/v3/.
-        # Try both variants for each field so the script works on either tier.
-        def g(*keys):
-            for k in keys:
-                if k in quote_data and quote_data[k] not in (None, ""):
-                    return quote_data[k]
-            return ""
+    quote_type = (info.get("quoteType") or "").upper()
+    is_etf = quote_type == "ETF"
+    is_fund = quote_type in ("MUTUALFUND", "FUND")
 
-        row["name"]       = g("name") or row["name"]
-        row["price"]      = g("price")
-        row["marketcap"]  = g("marketCap", "mktCap")
-        row["volume"]     = g("volume")
-        row["volumeavg"]  = g("avgVolume", "averageVolume")
-        row["priceopen"]  = g("open")
-        row["low"]        = g("dayLow", "low")
-        row["high"]       = g("dayHigh", "high")
-        row["close"]      = g("price", "close")
-        row["change"]     = g("change")
-        row["changepct"]  = g("changePercentage", "changesPercentage")
-        row["closeyest"]  = g("previousClose")
-        row["high52"]     = g("yearHigh")
-        row["low52"]      = g("yearLow")
-        row["pe"]         = g("pe", "priceEarningsRatio")
-        row["eps"]        = g("eps")
-        row["shares"]     = g("sharesOutstanding")
-        row["fetched_at"] = now_iso
-        ts = g("timestamp")
-        if ts:
-            try:
-                row["date"] = datetime.utcfromtimestamp(int(ts)).date().isoformat()
-            except (TypeError, ValueError):
-                pass
+    price = safe_get(info, "regularMarketPrice", "currentPrice", "previousClose", "navPrice")
+    prev_close = safe_get(info, "regularMarketPreviousClose", "previousClose")
+    change = None
+    change_pct = None
+    if isinstance(price, (int, float)) and isinstance(prev_close, (int, float)) and prev_close > 0:
+        change = price - prev_close
+        change_pct = (change / prev_close) * 100  # percent units, matches Valuatio's parsePctSheet
 
-    if profile_data:
-        row["name"]        = profile_data.get("companyName", row.get("name", ""))
-        row["sector"]      = profile_data.get("sector", "")
-        row["industry"]    = profile_data.get("industry", "")
-        row["description"] = (profile_data.get("description", "") or "")[:1000]
-        row["exchange"]    = profile_data.get("exchangeShortName", profile_data.get("exchange", ""))
-        row["ceo"]         = profile_data.get("ceo", "")
-        row["country"]     = profile_data.get("country", "")
-        row["ipodate"]     = profile_data.get("ipoDate", "")
-        row["beta"]        = profile_data.get("beta", "")
-        row["web_url"]     = profile_data.get("website", "")
-        row["image"]       = profile_data.get("image", "")
-        row["currency"]    = profile_data.get("currency", "")
-        row["employees"]   = profile_data.get("fullTimeEmployees", "")
-        row["city"]        = profile_data.get("city", "")
-        row["state"]       = profile_data.get("state", "")
-        row["phone"]       = profile_data.get("phone", "")
-        row["address"]     = profile_data.get("address", "")
-        row["isEtf"]       = "TRUE" if profile_data.get("isEtf") else "FALSE"
-        row["isFund"]      = "TRUE" if profile_data.get("isFund") else "FALSE"
-        row["isActive"]    = "TRUE" if profile_data.get("isActivelyTrading", True) else "FALSE"
-        row["profile_fetched_at"] = now_iso
+    row["name"]       = safe_get(info, "longName", "shortName", "displayName")
+    row["price"]      = price or ""
+    row["marketcap"]  = safe_get(info, "marketCap", "totalAssets")
+    row["volume"]     = safe_get(info, "regularMarketVolume", "volume")
+    row["volumeavg"]  = safe_get(info, "averageVolume", "averageDailyVolume10Day", "averageVolume10days")
+    row["priceopen"]  = safe_get(info, "regularMarketOpen", "open")
+    row["low"]        = safe_get(info, "regularMarketDayLow", "dayLow")
+    row["high"]       = safe_get(info, "regularMarketDayHigh", "dayHigh")
+    row["close"]      = price or ""
+    row["change"]     = change if change is not None else ""
+    row["changepct"]  = round(change_pct, 4) if change_pct is not None else ""
+    row["closeyest"]  = prev_close or ""
+    row["date"]       = now_iso()[:10]
+    row["high52"]     = safe_get(info, "fiftyTwoWeekHigh")
+    row["low52"]      = safe_get(info, "fiftyTwoWeekLow")
+    row["beta"]       = safe_get(info, "beta", "beta3Year")
+    row["shares"]     = safe_get(info, "sharesOutstanding", "impliedSharesOutstanding")
+    row["pe"]         = safe_get(info, "trailingPE", "forwardPE")
+    row["eps"]        = safe_get(info, "trailingEps", "forwardEps")
+    row["sector"]     = safe_get(info, "sector")
+    row["industry"]   = safe_get(info, "industry")
+    desc = safe_get(info, "longBusinessSummary")
+    if desc:
+        row["description"] = desc[:1000]
+    row["exchange"]   = safe_get(info, "exchange", "fullExchangeName")
+    row["country"]    = safe_get(info, "country")
+    row["currency"]   = safe_get(info, "currency", "financialCurrency")
+    row["employees"]  = safe_get(info, "fullTimeEmployees")
+    row["city"]       = safe_get(info, "city")
+    row["state"]      = safe_get(info, "state")
+    row["phone"]      = safe_get(info, "phone")
+    row["address"]    = safe_get(info, "address1", "address2")
+    row["web_url"]    = safe_get(info, "website")
+    row["image"]      = safe_get(info, "logo_url")
+    row["ipodate"]    = fmt_ipo_date(info)
+    row["ceo"]        = extract_ceo(info)
+    div_y = safe_get(info, "dividendYield", "trailingAnnualDividendYield", "yield")
+    if isinstance(div_y, (int, float)):
+        row["dividend_yield"] = round(div_y, 6)
+
+    row["isEtf"]    = "TRUE" if is_etf else "FALSE"
+    row["isFund"]   = "TRUE" if is_fund else "FALSE"
+    row["isActive"] = "TRUE"
+    row["fetched_at"] = now_iso()
 
     return row
 
 
-def main():
-    api_key = os.environ.get("FMP_API_KEY", "").strip()
-    if not api_key:
-        log("❌ FMP_API_KEY environment variable not set")
-        log("   Set it in your repo: Settings → Secrets and variables → Actions → New repository secret")
-        sys.exit(1)
+def fetch_batch(tickers):
+    """Fetch info for a batch of tickers via yf.Tickers().
+    Returns dict: {TICKER: info_dict_or_None}
+    """
+    if not tickers:
+        return {}
+    try:
+        tickers_obj = yf.Tickers(" ".join(tickers))
+    except Exception as e:
+        log(f"  Batch init failed: {e}")
+        return {t: None for t in tickers}
 
-    force_full_refresh = "--full" in sys.argv
+    out = {}
+    for t in tickers:
+        try:
+            tk = tickers_obj.tickers.get(t) or tickers_obj.tickers.get(t.upper())
+            if tk is None:
+                out[t] = None
+                continue
+            info = tk.info
+            # Empty / unrecognized ticker check
+            if not info or (not info.get("symbol") and not info.get("longName") and not info.get("shortName")):
+                out[t] = None
+            else:
+                out[t] = info
+        except Exception as e:
+            log(f"  {t}: {type(e).__name__}: {str(e)[:100]}")
+            out[t] = None
+    return out
+
+
+def main():
+    log("Valuatio fetcher · yfinance edition")
 
     tickers = load_tickers()
     log(f"Loaded {len(tickers)} tickers")
@@ -263,56 +258,25 @@ def main():
     existing = load_existing()
     log(f"Found {len(existing)} existing rows in master.csv")
 
-    # ─── FETCH QUOTES IN BATCHES ───
-    # Quote endpoint is bulk-friendly: 100 tickers per call.
-    log(f"Fetching live quotes in batches of {BATCH_SIZE}…")
-    all_quotes = {}
+    all_info = {}
     batches = [tickers[i:i + BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
+    log(f"Fetching in {len(batches)} batches of up to {BATCH_SIZE}…")
+
     for i, batch in enumerate(batches, 1):
         log(f"  Batch {i}/{len(batches)} ({len(batch)} tickers)")
-        result = fetch_batch_quotes(batch, api_key)
-        all_quotes.update(result)
-        log(f"    Got {len(result)} quotes back")
+        results = fetch_batch(batch)
+        success = sum(1 for v in results.values() if v)
+        log(f"    Got info for {success}/{len(batch)}")
+        all_info.update(results)
         if i < len(batches):
-            time.sleep(BATCH_DELAY_SEC)
-    log(f"Total quotes fetched: {len(all_quotes)}")
+            time.sleep(DELAY_BETWEEN_BATCHES)
 
-    # ─── FETCH PROFILES (only stale ones) ───
-    if force_full_refresh:
-        profile_tickers = list(tickers)
-        log(f"--full flag: refreshing ALL {len(profile_tickers)} profiles")
-    else:
-        profile_tickers = [t for t in tickers if should_refresh_profile(existing.get(t))]
-        log(f"Profiles to refresh (stale or missing): {len(profile_tickers)}")
-        log(f"Profiles cached + fresh: {len(tickers) - len(profile_tickers)}")
-
-    new_profiles = {}
-    daily_budget_remaining = 250 - len(batches) - 5  # leave room for retries
-    if len(profile_tickers) > daily_budget_remaining:
-        log(f"⚠ Capping profile refreshes at {daily_budget_remaining} to stay under daily quota")
-        profile_tickers = profile_tickers[:daily_budget_remaining]
-
-    for i, tic in enumerate(profile_tickers, 1):
-        if i % 25 == 0:
-            log(f"  Profile {i}/{len(profile_tickers)} (last: {tic})")
-        p = fetch_profile(tic, api_key)
-        if p:
-            new_profiles[tic] = p
-        # Light rate limit — be a good API citizen
-        time.sleep(0.05)
-    log(f"Profiles fetched: {len(new_profiles)}")
-
-    # ─── BUILD ROWS ───
     rows = []
     for tic in tickers:
-        quote_data = all_quotes.get(tic)
-        # Profile: prefer fresh, fall back to existing (we'll preserve fields in build_row)
-        profile_data = new_profiles.get(tic)
-        existing_row = existing.get(tic)
-        row = build_row(tic, quote_data, profile_data, existing_row)
+        info = all_info.get(tic)
+        row = build_row(tic, info, existing.get(tic))
         rows.append(row)
 
-    # ─── WRITE CSV ───
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     with OUTPUT_CSV.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
@@ -321,24 +285,27 @@ def main():
             writer.writerow(row)
     log(f"✓ Wrote {len(rows)} rows to {OUTPUT_CSV}")
 
-    # ─── ALSO WRITE JSON (smaller, faster for app to parse) ───
-    # Drop empty values to keep file size down
-    json_rows = []
-    for row in rows:
-        json_rows.append({k: v for k, v in row.items() if v not in ("", None)})
-    OUTPUT_JSON.write_text(json.dumps(json_rows, indent=None, separators=(",", ":")))
+    json_rows = [{k: v for k, v in r.items() if v not in ("", None)} for r in rows]
+    OUTPUT_JSON.write_text(json.dumps(json_rows, separators=(",", ":")))
     log(f"✓ Wrote {len(json_rows)} rows to {OUTPUT_JSON}")
 
-    # ─── SUMMARY ───
-    success_count = sum(1 for r in rows if r.get("price"))
-    log(f"")
-    log(f"Summary:")
-    log(f"  Total tickers:     {len(rows)}")
-    log(f"  With live price:   {success_count}")
-    log(f"  Without price:     {len(rows) - success_count}")
-    log(f"  Quote API calls:   {len(batches)}")
-    log(f"  Profile API calls: {len(new_profiles)}")
-    log(f"  Total API calls:   {len(batches) + len(new_profiles)} / 250 daily limit")
+    with_price = sum(1 for r in rows if r.get("price"))
+    with_name = sum(1 for r in rows if r.get("name"))
+    with_sector = sum(1 for r in rows if r.get("sector"))
+    log("")
+    log("Summary:")
+    log(f"  Total tickers:    {len(rows)}")
+    log(f"  With live price:  {with_price}")
+    log(f"  With name:        {with_name}")
+    log(f"  With sector:      {with_sector}")
+    log(f"  Failed this run:  {len(rows) - with_price}")
+    if with_price == 0:
+        log("")
+        log("⚠ No prices returned. Possible causes:")
+        log("  - Yahoo Finance temporarily rate-limited the runner")
+        log("  - yfinance broke due to a Yahoo Finance change (check pypi.org/project/yfinance for updates)")
+        log("  - All tickers in tickers.txt are invalid")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
