@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 """
-Valuatio history fetcher — pulls 5-year daily price history per ticker.
+Valuatio bulk PRICE HISTORY fetcher — yfinance edition.
 
-Writes one file per ticker to data/history/{TICKER}.json. Each file is small
-(~30 KB), and the app downloads only the ones it needs (lazy-load).
+Pulls 5 years of daily closing prices for every ticker in data/tickers.txt
+and writes them in wide format to data/prices.csv (also data/prices.json).
 
-Schema per file:
-{
-  "ticker": "AAPL",
-  "fetched_at": "2026-05-11T22:00:00",
-  "start": "2020-05-11",
-  "end":   "2026-05-09",
-  "n":     1257,
-  "data":  [
-    {"date": "2020-05-11", "price": 79.81},
-    {"date": "2020-05-12", "price": 77.85},
+Wide format example:
+    date,AAPL,MSFT,NVDA
+    2020-05-12,72.50,184.91,8.95
+    2020-05-13,71.13,182.69,8.81
     ...
-  ]
-}
 
-Designed to be smart about incremental updates: if a ticker already has a
-history file with recent data, only fetches the latest bars and appends.
-A full 5-year refresh only happens on first run or weekly --full passes.
+This matches the format that Valuatio's existing sheet parser already
+understands (Layout 3 — Date in col A, tickers across row 1).
+
+Incremental updates:
+  - First run: pulls 5 years for every ticker
+  - Later runs: only fetches NEW dates (since last update) for existing
+    tickers. New tickers get a full 5-year backfill on first sight.
+  - Result: most runs are quick (a few new days per ticker) and stay
+    well under any rate limits.
 """
 
+import csv
 import json
 import os
 import sys
@@ -39,18 +38,16 @@ except ImportError:
 
 ROOT = Path(__file__).parent
 TICKERS_FILE = ROOT / "data" / "tickers.txt"
-HISTORY_DIR = ROOT / "data" / "history"
+OUTPUT_CSV = ROOT / "data" / "prices.csv"
+OUTPUT_JSON = ROOT / "data" / "prices.json"
 
-# Yahoo allows large batch downloads via yf.download(). 50 at a time is safe.
+# How far back to pull on first sight of a new ticker
+HISTORY_YEARS = 5
+
+# Batch tickers per yf.download() call. yfinance handles multi-ticker downloads
+# more efficiently than per-ticker history() calls.
 BATCH_SIZE = 50
-DELAY_BETWEEN_BATCHES = 2.0
-
-# How far back to fetch on a fresh ticker (no existing history file)
-FULL_HISTORY_PERIOD = "5y"
-
-# How many days of recent data to fetch on incremental update.
-# 10 calendar days covers any reasonable gap including 3-day weekends.
-INCREMENTAL_DAYS = 10
+DELAY_BETWEEN_BATCHES = 1.5  # seconds
 
 
 def log(*args):
@@ -70,230 +67,245 @@ def load_tickers():
     return tickers
 
 
-def history_path(ticker):
-    # Sanitize ticker for filesystem (^ and = are valid in some tickers)
-    safe = ticker.replace("/", "_").replace("\\", "_")
-    return HISTORY_DIR / f"{safe}.json"
-
-
-def load_existing_history(ticker):
-    p = history_path(ticker)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def save_history(ticker, data_points):
-    """Write a ticker's history file. data_points is a sorted list of {date, price}."""
-    if not data_points:
-        return False
-    p = history_path(ticker)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    record = {
-        "ticker": ticker,
-        "fetched_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds"),
-        "start": data_points[0]["date"],
-        "end": data_points[-1]["date"],
-        "n": len(data_points),
-        "data": data_points,
-    }
-    # Compact JSON to keep file size small
-    p.write_text(json.dumps(record, separators=(",", ":")))
-    return True
-
-
-def yf_history_to_points(df, ticker):
-    """Convert a yfinance DataFrame slice for one ticker to [{date, price}].
-    Uses adjusted close so splits/dividends are normalized.
+def load_existing_prices():
+    """Load existing prices.csv into a dict-of-dicts: {date: {ticker: price}}.
+    Returns ({}, set()) if no file yet.
     """
-    points = []
-    if df is None or df.empty:
-        return points
-
-    # For multi-ticker downloads, columns are tuples (field, ticker) — use the slice
-    # For single-ticker, columns are (field,) — handle both
-    if hasattr(df.columns, "levels") and len(df.columns.levels) > 1:
-        # MultiIndex columns from yf.download(group_by='ticker' or default)
-        try:
-            close_series = df["Close"][ticker] if ticker in df["Close"].columns else None
-        except (KeyError, AttributeError):
-            close_series = None
-    else:
-        close_series = df.get("Close") if "Close" in df.columns else None
-
-    if close_series is None or close_series.empty:
-        return points
-
-    for date_idx, val in close_series.items():
-        # val may be NaN on non-trading days that slipped through
-        if val is None:
-            continue
-        try:
-            v = float(val)
-        except (TypeError, ValueError):
-            continue
-        # NaN check
-        if v != v or v <= 0:
-            continue
-        # date_idx is a pandas Timestamp
-        date_str = date_idx.strftime("%Y-%m-%d") if hasattr(date_idx, "strftime") else str(date_idx)[:10]
-        points.append({"date": date_str, "price": round(v, 4)})
-    return points
+    if not OUTPUT_CSV.exists():
+        return {}, set()
+    prices = {}  # {date: {ticker: float}}
+    tickers_seen = set()
+    with OUTPUT_CSV.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if not header or header[0].lower() != "date":
+            log("⚠ Existing prices.csv has unexpected format, ignoring it")
+            return {}, set()
+        col_tickers = header[1:]
+        tickers_seen.update(col_tickers)
+        for row in reader:
+            if not row:
+                continue
+            date = row[0]
+            if not date:
+                continue
+            prices[date] = {}
+            for i, ticker in enumerate(col_tickers, start=1):
+                if i < len(row) and row[i].strip():
+                    try:
+                        prices[date][ticker] = float(row[i])
+                    except ValueError:
+                        pass
+    return prices, tickers_seen
 
 
-def merge_history(existing_points, new_points):
-    """Merge two sorted lists of {date, price}, deduping by date. Latest wins."""
-    by_date = {p["date"]: p for p in (existing_points or [])}
-    for p in new_points:
-        by_date[p["date"]] = p
-    return sorted(by_date.values(), key=lambda p: p["date"])
+def determine_start_date(ticker, existing_prices, tickers_seen):
+    """Decide how far back to fetch for a given ticker.
+    - If new ticker: 5 years back
+    - If existing ticker: from last seen date forward (small incremental fetch)
+    """
+    five_years_ago = (datetime.now(timezone.utc).replace(tzinfo=None)
+                      - timedelta(days=HISTORY_YEARS * 365 + 5)).date().isoformat()
+    if ticker not in tickers_seen:
+        return five_years_ago  # New ticker — full backfill
+
+    # Find the most recent date this ticker has data for
+    latest = None
+    for date_iso, prices_by_tic in existing_prices.items():
+        if ticker in prices_by_tic:
+            if latest is None or date_iso > latest:
+                latest = date_iso
+    if latest is None:
+        return five_years_ago
+
+    # Resume from the day after the last known date
+    latest_dt = datetime.fromisoformat(latest)
+    next_dt = latest_dt + timedelta(days=1)
+    return next_dt.date().isoformat()
 
 
-def fetch_full_batch(tickers):
-    """Fetch full 5-year history for a list of tickers in one yf.download() call.
-    Returns dict: {TICKER: [{date, price}, ...]}
+def fetch_history_batch(tickers, start_date):
+    """Fetch daily history for a batch of tickers from start_date to today.
+    Returns dict: {ticker: {date_iso: close_price}}
     """
     if not tickers:
         return {}
+    end_date = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1)).date().isoformat()
+
     try:
-        # auto_adjust=True returns split/dividend-adjusted prices (cleaner for analysis)
-        # progress=False suppresses yfinance's noisy progress bars
-        df = yf.download(
-            tickers=" ".join(tickers),
-            period=FULL_HISTORY_PERIOD,
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-            group_by="column",
-        )
-    except Exception as e:
-        log(f"  Batch download failed: {e}")
-        return {}
-
-    out = {}
-    for t in tickers:
-        out[t] = yf_history_to_points(df, t)
-    return out
-
-
-def fetch_incremental_batch(tickers):
-    """Fetch only recent bars for tickers that already have history.
-    Same shape as fetch_full_batch.
-    """
-    if not tickers:
-        return {}
-    start_date = (datetime.now(timezone.utc) - timedelta(days=INCREMENTAL_DAYS)).date().isoformat()
-    try:
+        # yf.download with group_by='ticker' returns a hierarchical DataFrame
+        # auto_adjust=True applies split/dividend adjustments (cleaner for chart math)
         df = yf.download(
             tickers=" ".join(tickers),
             start=start_date,
+            end=end_date,
             interval="1d",
+            group_by="ticker",
             auto_adjust=True,
             progress=False,
             threads=True,
-            group_by="column",
         )
     except Exception as e:
-        log(f"  Incremental download failed: {e}")
+        log(f"  yf.download failed: {type(e).__name__}: {str(e)[:120]}")
         return {}
+
     out = {}
+    if df is None or df.empty:
+        return {t: {} for t in tickers}
+
+    # Handle the two shapes yfinance returns depending on ticker count
+    if len(tickers) == 1:
+        # Single-ticker: flat columns
+        t = tickers[0]
+        out[t] = {}
+        if "Close" in df.columns:
+            for idx, row in df.iterrows():
+                d = idx.strftime("%Y-%m-%d")
+                close = row["Close"]
+                if close is not None and not (isinstance(close, float) and (close != close)):  # NaN check
+                    out[t][d] = float(close)
+        return out
+
+    # Multi-ticker: hierarchical (ticker, field) columns
     for t in tickers:
-        out[t] = yf_history_to_points(df, t)
+        out[t] = {}
+        try:
+            # Try ticker as outermost level
+            sub = df[t] if t in df.columns.get_level_values(0) else None
+            if sub is None or "Close" not in sub.columns:
+                continue
+            for idx, val in sub["Close"].items():
+                if val is None:
+                    continue
+                if isinstance(val, float) and val != val:  # NaN
+                    continue
+                d = idx.strftime("%Y-%m-%d")
+                out[t][d] = float(val)
+        except (KeyError, AttributeError) as e:
+            log(f"  {t}: failed to extract: {e}")
     return out
+
+
+def merge_into_existing(existing, new_data):
+    """Merge new fetched data into the existing prices dict.
+    existing: {date: {ticker: price}}
+    new_data: {ticker: {date: price}}
+    """
+    for ticker, by_date in new_data.items():
+        for date_iso, price in by_date.items():
+            if date_iso not in existing:
+                existing[date_iso] = {}
+            existing[date_iso][ticker] = price
+    return existing
+
+
+def write_outputs(all_prices, all_tickers):
+    """Write prices.csv (wide format) and prices.json."""
+    sorted_dates = sorted(all_prices.keys())
+    sorted_tickers = sorted(all_tickers)
+
+    # CSV (wide format — matches Valuatio's existing Layout 3 parser)
+    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    with OUTPUT_CSV.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["date"] + sorted_tickers)
+        for date_iso in sorted_dates:
+            row = [date_iso]
+            row_prices = all_prices[date_iso]
+            for t in sorted_tickers:
+                p = row_prices.get(t)
+                # 4 decimal places balances precision against file size
+                row.append(f"{p:.4f}" if p is not None else "")
+            writer.writerow(row)
+    log(f"✓ Wrote {len(sorted_dates)} dates × {len(sorted_tickers)} tickers to {OUTPUT_CSV}")
+
+    # JSON — keyed by ticker for fast lookup in the app.
+    # Shape: {ticker: [{date: "YYYY-MM-DD", price: float}, ...]}
+    json_out = {}
+    for t in sorted_tickers:
+        series = []
+        for date_iso in sorted_dates:
+            p = all_prices[date_iso].get(t)
+            if p is not None:
+                series.append({"date": date_iso, "price": round(p, 4)})
+        if series:
+            json_out[t] = series
+    OUTPUT_JSON.write_text(json.dumps(json_out, separators=(",", ":")))
+    sz_kb = OUTPUT_JSON.stat().st_size // 1024
+    log(f"✓ Wrote {len(json_out)} ticker series to {OUTPUT_JSON} ({sz_kb} KB)")
 
 
 def main():
     log("Valuatio history fetcher · yfinance edition")
-    force_full = "--full" in sys.argv
-
     tickers = load_tickers()
     log(f"Loaded {len(tickers)} tickers")
 
-    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    existing_prices, tickers_seen = load_existing_prices()
+    n_existing_dates = len(existing_prices)
+    log(f"Existing prices.csv: {n_existing_dates} dates, {len(tickers_seen)} tickers")
 
-    # Split tickers: those needing FULL history (new or --full) vs INCREMENTAL
-    full_needed = []
-    incremental_needed = []
-    for t in tickers:
-        existing = load_existing_history(t)
-        if force_full or not existing or not existing.get("data"):
-            full_needed.append(t)
+    # Decide start date per ticker
+    new_tickers = [t for t in tickers if t not in tickers_seen]
+    existing_tickers = [t for t in tickers if t in tickers_seen]
+    log(f"  New tickers (5yr backfill):  {len(new_tickers)}")
+    log(f"  Existing (incremental):      {len(existing_tickers)}")
+
+    # ── Phase 1: incremental for existing tickers ──
+    if existing_tickers:
+        # Group by start date so we can batch tickers that need the same range
+        # For simplicity: use the EARLIEST resume date across all existing tickers
+        # (yfinance handles per-ticker date alignment internally)
+        resume_dates = [determine_start_date(t, existing_prices, tickers_seen) for t in existing_tickers]
+        earliest_resume = min(resume_dates) if resume_dates else None
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+        if earliest_resume and earliest_resume <= today_iso:
+            log(f"Incremental fetch from {earliest_resume} → today for {len(existing_tickers)} tickers")
+            batches = [existing_tickers[i:i + BATCH_SIZE] for i in range(0, len(existing_tickers), BATCH_SIZE)]
+            for i, batch in enumerate(batches, 1):
+                log(f"  Batch {i}/{len(batches)} ({len(batch)} tickers)")
+                result = fetch_history_batch(batch, earliest_resume)
+                total_new = sum(len(v) for v in result.values())
+                log(f"    Got {total_new} new data points")
+                merge_into_existing(existing_prices, result)
+                if i < len(batches):
+                    time.sleep(DELAY_BETWEEN_BATCHES)
         else:
-            incremental_needed.append(t)
-    log(f"  Full 5y refresh needed: {len(full_needed)}")
-    log(f"  Incremental update:    {len(incremental_needed)}")
+            log("Existing tickers all up-to-date — skipping incremental")
 
-    success_count = 0
-    failure_count = 0
-
-    # ── Full refresh batches ──
-    if full_needed:
-        log(f"Fetching full 5-year history in batches of {BATCH_SIZE}…")
-        batches = [full_needed[i:i + BATCH_SIZE] for i in range(0, len(full_needed), BATCH_SIZE)]
+    # ── Phase 2: full backfill for new tickers ──
+    if new_tickers:
+        five_years_ago = (datetime.now(timezone.utc).replace(tzinfo=None)
+                          - timedelta(days=HISTORY_YEARS * 365 + 5)).date().isoformat()
+        log(f"Backfilling {len(new_tickers)} new tickers from {five_years_ago}")
+        batches = [new_tickers[i:i + BATCH_SIZE] for i in range(0, len(new_tickers), BATCH_SIZE)]
         for i, batch in enumerate(batches, 1):
-            log(f"  Full batch {i}/{len(batches)} ({len(batch)} tickers)")
-            results = fetch_full_batch(batch)
-            for t in batch:
-                points = results.get(t) or []
-                if points:
-                    if save_history(t, points):
-                        success_count += 1
-                else:
-                    failure_count += 1
+            log(f"  Backfill batch {i}/{len(batches)} ({len(batch)} tickers)")
+            result = fetch_history_batch(batch, five_years_ago)
+            total_new = sum(len(v) for v in result.values())
+            log(f"    Got {total_new} data points")
+            merge_into_existing(existing_prices, result)
             if i < len(batches):
                 time.sleep(DELAY_BETWEEN_BATCHES)
 
-    # ── Incremental batches ──
-    if incremental_needed:
-        log(f"Fetching incremental updates in batches of {BATCH_SIZE}…")
-        batches = [incremental_needed[i:i + BATCH_SIZE] for i in range(0, len(incremental_needed), BATCH_SIZE)]
-        for i, batch in enumerate(batches, 1):
-            log(f"  Incremental batch {i}/{len(batches)} ({len(batch)} tickers)")
-            results = fetch_incremental_batch(batch)
-            for t in batch:
-                new_points = results.get(t) or []
-                existing = load_existing_history(t)
-                existing_points = existing.get("data", []) if existing else []
-                if new_points:
-                    merged = merge_history(existing_points, new_points)
-                    if save_history(t, merged):
-                        success_count += 1
-                else:
-                    # Keep the old file as-is; just count as no-update
-                    pass
-            if i < len(batches):
-                time.sleep(DELAY_BETWEEN_BATCHES)
+    # ── Write outputs ──
+    all_tickers_to_write = set(tickers) | tickers_seen
+    write_outputs(existing_prices, all_tickers_to_write)
 
-    # ── Manifest: tiny file listing every ticker that has a history file ──
-    # Lets the app know which tickers have history available without HEAD requests.
-    manifest = {
-        "generated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds"),
-        "tickers": [],
-    }
+    # ── Summary ──
+    coverage = {}
     for t in tickers:
-        h = load_existing_history(t)
-        if h and h.get("n", 0) > 0:
-            manifest["tickers"].append({
-                "ticker": t,
-                "start": h.get("start"),
-                "end": h.get("end"),
-                "n": h.get("n"),
-            })
-    (ROOT / "data" / "history_manifest.json").write_text(
-        json.dumps(manifest, separators=(",", ":"))
-    )
-    log(f"✓ Manifest written: {len(manifest['tickers'])} tickers have history")
-
+        count = sum(1 for d in existing_prices if t in existing_prices[d])
+        coverage[t] = count
+    avg_coverage = sum(coverage.values()) / len(coverage) if coverage else 0
+    missing = [t for t, c in coverage.items() if c == 0]
     log("")
     log("Summary:")
-    log(f"  Total tickers:       {len(tickers)}")
-    log(f"  Updated this run:    {success_count}")
-    log(f"  Failed this run:     {failure_count}")
-    log(f"  Tickers with history: {len(manifest['tickers'])}")
+    log(f"  Total tickers:         {len(tickers)}")
+    log(f"  Total dates:           {len(existing_prices)}")
+    log(f"  Avg history per tic:   {avg_coverage:.0f} bars")
+    log(f"  Tickers with no data:  {len(missing)}")
+    if missing:
+        log(f"    Missing: {', '.join(missing[:10])}{'…' if len(missing) > 10 else ''}")
 
 
 if __name__ == "__main__":
