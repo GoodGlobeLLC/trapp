@@ -100,7 +100,7 @@ def fetch_batch_quotes(tickers, api_key):
     if not tickers:
         return {}
     symbols = ",".join(tickers)
-    url = f"https://financialmodelingprep.com/api/v3/quote/{quote(symbols)}?apikey={api_key}"
+    url = f"https://financialmodelingprep.com/stable/batch-quote?symbols={quote(symbols)}&apikey={api_key}"
     data = fetch_json(url)
     if not isinstance(data, list):
         return {}
@@ -109,7 +109,7 @@ def fetch_batch_quotes(tickers, api_key):
 
 def fetch_profile(ticker, api_key):
     """Fetch full company profile (one ticker = one call). Used sparingly."""
-    url = f"https://financialmodelingprep.com/api/v3/profile/{quote(ticker)}?apikey={api_key}"
+    url = f"https://financialmodelingprep.com/stable/profile?symbol={quote(ticker)}&apikey={api_key}"
     data = fetch_json(url)
     if isinstance(data, list) and data:
         return data[0]
@@ -126,9 +126,9 @@ def should_refresh_profile(existing_row):
     if not last:
         return True
     try:
-        from datetime import datetime
+        from datetime import datetime, timezone
         last_dt = datetime.fromisoformat(last)
-        age_days = (datetime.utcnow() - last_dt).days
+        age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - last_dt).days
         return age_days >= PROFILE_REFRESH_DAYS
     except (ValueError, TypeError):
         return True
@@ -181,34 +181,41 @@ OUTPUT_COLUMNS = [
 
 def build_row(ticker, quote_data, profile_data, existing_row):
     """Merge quote + profile + existing into a single CSV row."""
-    from datetime import datetime
-    now_iso = datetime.utcnow().isoformat(timespec="seconds")
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
 
     # Start with whatever we had before so unchanged fields persist
     row = {col: (existing_row.get(col, "") if existing_row else "") for col in OUTPUT_COLUMNS}
     row["ticker"] = ticker
 
     if quote_data:
-        # Map FMP /quote fields → our schema
-        row["name"]       = quote_data.get("name", row["name"])
-        row["price"]      = quote_data.get("price", "")
-        row["marketcap"]  = quote_data.get("marketCap", "")
-        row["volume"]     = quote_data.get("volume", "")
-        row["volumeavg"]  = quote_data.get("avgVolume", "")
-        row["priceopen"]  = quote_data.get("open", "")
-        row["low"]        = quote_data.get("dayLow", "")
-        row["high"]       = quote_data.get("dayHigh", "")
-        row["close"]      = quote_data.get("price", "")
-        row["change"]     = quote_data.get("change", "")
-        row["changepct"]  = quote_data.get("changesPercentage", "")
-        row["closeyest"]  = quote_data.get("previousClose", "")
-        row["high52"]     = quote_data.get("yearHigh", "")
-        row["low52"]      = quote_data.get("yearLow", "")
-        row["pe"]         = quote_data.get("pe", "")
-        row["eps"]        = quote_data.get("eps", "")
-        row["shares"]     = quote_data.get("sharesOutstanding", "")
+        # /stable/ endpoints use slightly different field names than /api/v3/.
+        # Try both variants for each field so the script works on either tier.
+        def g(*keys):
+            for k in keys:
+                if k in quote_data and quote_data[k] not in (None, ""):
+                    return quote_data[k]
+            return ""
+
+        row["name"]       = g("name") or row["name"]
+        row["price"]      = g("price")
+        row["marketcap"]  = g("marketCap", "mktCap")
+        row["volume"]     = g("volume")
+        row["volumeavg"]  = g("avgVolume", "averageVolume")
+        row["priceopen"]  = g("open")
+        row["low"]        = g("dayLow", "low")
+        row["high"]       = g("dayHigh", "high")
+        row["close"]      = g("price", "close")
+        row["change"]     = g("change")
+        row["changepct"]  = g("changePercentage", "changesPercentage")
+        row["closeyest"]  = g("previousClose")
+        row["high52"]     = g("yearHigh")
+        row["low52"]      = g("yearLow")
+        row["pe"]         = g("pe", "priceEarningsRatio")
+        row["eps"]        = g("eps")
+        row["shares"]     = g("sharesOutstanding")
         row["fetched_at"] = now_iso
-        ts = quote_data.get("timestamp")
+        ts = g("timestamp")
         if ts:
             try:
                 row["date"] = datetime.utcfromtimestamp(int(ts)).date().isoformat()
