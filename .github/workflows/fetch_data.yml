@@ -1,17 +1,22 @@
 name: Fetch Stock Data
 
-# When this workflow runs:
-#   - Every weekday at 5pm Eastern Time (after market close, 22:00 UTC)
-#   - Every weekday at 11am Eastern Time (midday update, 16:00 UTC)
-#   - Manually via "Run workflow" button in the Actions tab
+# Two scheduled jobs:
+#   1. fetch — live quotes + fundamentals (twice a day on weekdays)
+#   2. fetch-history — 5y daily price history (once a day after market close)
 on:
   schedule:
-    - cron: '0 16 * * 1-5'   # 11am ET weekdays
-    - cron: '0 22 * * 1-5'   # 5pm ET weekdays
+    - cron: '0 16 * * 1-5'   # 11am ET weekdays — live quotes only
+    - cron: '0 22 * * 1-5'   # 5pm ET weekdays — live quotes + history
   workflow_dispatch:
+    inputs:
+      full_history:
+        description: 'Force full 5-year history refresh (uses more bandwidth)'
+        type: boolean
+        default: false
 
 jobs:
   fetch:
+    name: Live quotes + fundamentals
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -36,10 +41,55 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Pull first in case the history job is also pushing
+          git pull --rebase --autostash || true
           git add data/master.csv data/master.json
           if git diff --staged --quiet; then
             echo "No data changes to commit"
           else
             git commit -m "Update market data $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
+
+  fetch-history:
+    name: 5-year price history
+    runs-on: ubuntu-latest
+    # Only run on the 5pm cron OR manual trigger — not the midday run
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 22 * * 1-5'
+    needs: fetch   # wait for live data to commit first to avoid push collisions
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install yfinance
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'yfinance>=0.2.50,<0.3'
+
+      - name: Run history fetcher
+        run: |
+          if [ "${{ inputs.full_history }}" = "true" ]; then
+            python fetch_history.py --full
+          else
+            python fetch_history.py
+          fi
+
+      - name: Commit and push history files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --autostash || true
+          git add data/history/ data/history_manifest.json
+          if git diff --staged --quiet; then
+            echo "No history changes to commit"
+          else
+            git commit -m "Update price history $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             git push
           fi
