@@ -214,6 +214,10 @@ DLR
 EXR
 AVB
 VICI
+CSCO
+COP
+PXD
+
 
 
 # Major ETFs
