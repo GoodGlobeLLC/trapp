@@ -261,3 +261,18 @@ VCSH
 
 # Metals
 GLD
+
+# Futures/Commodities
+ES=F
+YM=F
+NQ=F
+ZS=F
+CT=F
+SI=F
+ZC=F
+ZW=F
+
+# World Inidices
+^MERV
+^XDE
+^GSPTSE
